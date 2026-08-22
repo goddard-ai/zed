@@ -393,6 +393,77 @@ impl ListState {
         state.items = tree;
     }
 
+    /// Seed the items in `range` with per-item height hints — typically heights
+    /// the caller kept from an earlier layout of the same content — so the
+    /// list's total height, and with it the scrollbar extent and scroll math
+    /// through unmeasured regions, reflects the real document before those
+    /// items are rendered.
+    ///
+    /// A hint only stands in for a missing measurement: items that have already
+    /// been measured keep their measured size, a `None` hint leaves an item's
+    /// existing hint untouched, and a hint is replaced by the real height as
+    /// soon as the item is rendered. Hints beyond the end of the list are
+    /// ignored.
+    pub fn set_size_hints(
+        &self,
+        range: Range<usize>,
+        hints: impl IntoIterator<Item = Option<Pixels>>,
+    ) {
+        let state = &mut *self.0.borrow_mut();
+        let count = state.items.summary().count;
+        let range = range.start.min(count)..range.end.min(count);
+        if range.is_empty() {
+            return;
+        }
+
+        let mut hints = hints.into_iter();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut new_items = cursor.slice(&Count(range.start), Bias::Right);
+        let hinted = cursor.slice(&Count(range.end), Bias::Right);
+        new_items.extend(
+            hinted.iter().map(|item| {
+                let hint = hints.next().flatten();
+                match item {
+                    ListItem::Measured { .. } => item.clone(),
+                    ListItem::Unmeasured {
+                        size_hint,
+                        focus_handle,
+                    } => ListItem::Unmeasured {
+                        size_hint: hint
+                            .map(|height| Size {
+                                width: px(0.),
+                                height,
+                            })
+                            .or(*size_hint),
+                        focus_handle: focus_handle.clone(),
+                    },
+                }
+            }),
+            (),
+        );
+        new_items.append(cursor.suffix(), ());
+        drop(cursor);
+        state.items = new_items;
+    }
+
+    /// The measured height of each item in `range`, or `None` for an item that
+    /// has not been rendered at the list's current width.
+    ///
+    /// Hints are deliberately not reported, so a caller that persists these
+    /// heights to feed back through [`Self::set_size_hints`] never turns an
+    /// estimate into a fact. Indexes past the end of the list are skipped.
+    pub fn measured_heights(&self, range: Range<usize>) -> Vec<Option<Pixels>> {
+        let state = self.0.borrow();
+        let count = state.items.summary().count;
+        let range = range.start.min(count)..range.end.min(count);
+        let mut cursor = state.items.cursor::<Count>(());
+        cursor.seek(&Count(range.start), Bias::Right);
+        cursor
+            .take(range.len())
+            .map(|item| item.size().map(|size| size.height))
+            .collect()
+    }
+
     /// Remeasure all items while preserving proportional scroll position.
     ///
     /// Use this when item heights may have changed (e.g., font size changes)
@@ -1540,14 +1611,19 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
+        // If the width of the list has changed, invalidate all cached item
+        // heights. The stale sizes stay on as hints: a height measured at the
+        // old width is a far better stand-in for the scrollbar extent and for
+        // scroll math through unrendered items than the zero an unhinted item
+        // contributes, and each hint gives way to a real measurement as soon
+        // as its item is rendered at the new width.
         if state
             .last_layout_bounds
             .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: item.size_hint(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -2096,6 +2172,100 @@ mod test {
             view.into_any_element()
         });
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[gpui::test]
+    fn test_size_hints_stand_in_until_measured(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Ten 50px items in a 100px viewport with no overdraw: a fresh draw
+        // measures only the two visible items.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        // Before any layout nothing is measured and hints are the only height.
+        assert_eq!(state.measured_heights(0..10), vec![None; 10]);
+        state.set_size_hints(0..10, (0..10).map(|_| Some(px(80.))));
+        assert_eq!(state.measured_heights(0..10), vec![None; 10]);
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        // The two visible items now report their real 50px; the eight
+        // unrendered ones are still `None` even though they carry a hint.
+        let heights = state.measured_heights(0..10);
+        assert_eq!(&heights[..2], &[Some(px(50.)), Some(px(50.))]);
+        assert_eq!(&heights[2..], &[None; 8]);
+
+        // Total height is 2 × 50 measured + 8 × 80 hinted = 740, minus the
+        // 100px viewport.
+        assert_eq!(state.max_offset_for_scrollbar().y, px(640.));
+
+        // A hint never overrides a measurement, and `None` leaves an existing
+        // hint alone.
+        state.set_size_hints(0..4, [Some(px(10.)), None, None, Some(px(20.))]);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(580.));
+
+        // Hints past the end of the list are ignored rather than panicking.
+        state.set_size_hints(8..20, (0..12).map(|_| Some(px(30.))));
+        assert_eq!(state.max_offset_for_scrollbar().y, px(480.));
+        assert_eq!(state.measured_heights(8..20).len(), 2);
+    }
+
+    #[gpui::test]
+    fn test_width_change_keeps_measurements_as_hints(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+
+        // Measure everything once by scrolling through the whole list.
+        for ix in (0..10).rev() {
+            state.scroll_to(gpui::ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+        assert_eq!(state.measured_heights(0..10), vec![Some(px(50.)); 10]);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(400.));
+
+        // A new width invalidates every measurement, but the old heights stay
+        // on as hints, so the extent holds instead of collapsing to the two
+        // freshly rendered items.
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+        let heights = state.measured_heights(0..10);
+        assert_eq!(&heights[..2], &[Some(px(50.)), Some(px(50.))]);
+        assert_eq!(&heights[2..], &[None; 8]);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(400.));
     }
 
     #[gpui::test]
