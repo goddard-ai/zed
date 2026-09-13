@@ -332,7 +332,21 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
 
 fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+  let curved_circle =
+      half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+
+  // The corner shape is the intersection of the circular arc and the shoulder
+  // superellipse, so the silhouette's cross-section is the nearer of the two
+  // extents.
+  let corner_smoothing = corner_smoothing_params(corner, half_size * 2.0);
+  let span = corner_smoothing.x;
+  var curved_shoulder = curved_circle;
+  if (span > corner) {
+    let t = clamp((span - (half_size.y - abs(y))) / span, 0.0, 1.0);
+    curved_shoulder = half_size.x - span +
+        span * pow(1.0 - pow(t, corner_smoothing.y), 1.0 / corner_smoothing.y);
+  }
+  let curved = min(curved_circle, curved_shoulder);
   let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
 }
@@ -354,6 +368,36 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
     }
 }
 
+// Figma-style corner smoothing applied to every rounded corner. A smoothed
+// corner keeps the circular arc near the diagonal and adds a superellipse
+// "shoulder" that extends the tangency to K_CORNER_SPAN * radius along each
+// adjacent edge. The silhouette is the intersection of the two, which tracks
+// Figma's cubic-arc-cubic corner curve within ~0.2% of the radius.
+const K_CORNER_SPAN: f32 = 1.42;
+
+// The shoulder superellipse's exponent interpolates from a circle (2) when
+// the span is capped toward the radius, up to ~3.2 at full span.
+const K_CORNER_EXPONENT_SLOPE: f32 = 2.86;
+
+// Per-corner smoothed-corner parameters: the shoulder's tangency span along
+// each adjacent edge, and the superellipse exponent fitted to Figma's curve.
+fn corner_smoothing_params(corner_radius: f32, size: vec2<f32>) -> vec2<f32> {
+    // The shoulder can reach at most halfway along the shortest edge, so
+    // adjacent corners never overlap and saturated corners (pills, discs)
+    // keep their circular silhouette.
+    let span = min(K_CORNER_SPAN * corner_radius, min(size.x, size.y) * 0.5);
+    let exponent = 2.0 + K_CORNER_EXPONENT_SLOPE *
+        max(0.0, span / max(corner_radius, 1e-4) - 1.0);
+    return vec2<f32>(span, exponent);
+}
+
+// Arc length of a smoothed corner: the circular arc plus two near-straight
+// shoulders. Equals pi/2 * radius when the span collapses to the radius.
+fn corner_arc_length(corner_radius: f32, corner_span: f32) -> f32 {
+    return (M_PI_F / 2.0) * corner_radius +
+        1.98 * (corner_span - corner_radius);
+}
+
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 //
@@ -366,24 +410,60 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     let corner_radius = pick_corner_radius(center_to_point, corner_radii);
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    let corner_smoothing = corner_smoothing_params(corner_radius, bounds.size);
+    return quad_sdf_impl(corner_center_to_point, corner_radius,
+                         corner_smoothing.x, corner_smoothing.y);
 }
 
-fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
+// Approximate signed distance to the superellipse |x/a|^n + |y/b|^n = 1, via
+// first-order normalization of its implicit function. Accurate near the
+// curve, which is all the antialiasing and border logic needs. Expects point
+// components >= 0. Negative inside, positive outside.
+fn superellipse_sdf(point: vec2<f32>, radii: vec2<f32>, exponent: f32) -> f32 {
+    let e = pow(point / radii, vec2<f32>(exponent));
+    let s = max(e.x + e.y, 1e-12);
+    let f = pow(s, 1.0 / exponent) - 1.0;
+    let grad_xy = pow(point, vec2<f32>(exponent - 1.0)) / pow(radii, vec2<f32>(exponent));
+    let grad = pow(s, (1.0 - exponent) / exponent) * length(grad_xy);
+    return f / max(grad, 1e-5);
+}
+
+fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32,
+                 corner_span: f32, corner_exponent: f32) -> f32 {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
-    } else {
-        // Signed distance of the point from a quad that is inset by corner_radius.
-        // It is negative inside this quad, and positive outside.
-        let signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside.
-            length(max(vec2<f32>(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside.
-            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
-
-        return signed_distance_to_inset_quad - corner_radius;
     }
+
+    // Signed distance of the point from a quad that is inset by
+    // corner_radius. It is negative inside this quad, and positive outside.
+    let signed_distance_to_inset_quad =
+        // 0 inside the inset quad, and positive outside.
+        length(max(vec2<f32>(0.0), corner_center_to_point)) +
+        // 0 outside the inset quad, and negative inside.
+        min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+
+    let circular = signed_distance_to_inset_quad - corner_radius;
+    if (corner_span <= corner_radius) {
+        return circular;
+    }
+
+    // The shoulder superellipse is centered corner_span from the quad's
+    // edges. It cuts deeper than the circle near the edges and loses to it
+    // near the diagonal, so the max of the two traces the smoothed corner.
+    let super_center_to_point =
+        corner_center_to_point + (corner_span - corner_radius);
+    var shoulder = 0.0;
+    if (super_center_to_point.x > 0.0 && super_center_to_point.y > 0.0) {
+        shoulder = superellipse_sdf(super_center_to_point,
+                                  vec2<f32>(corner_span), corner_exponent);
+    } else {
+        shoulder =
+            length(max(vec2<f32>(0.0), super_center_to_point)) +
+            min(0.0, max(super_center_to_point.x, super_center_to_point.y)) -
+            corner_span;
+    }
+    return max(circular, shoulder);
 }
 
 // Abstract away the final color transformation based on the
@@ -599,6 +679,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Radius of the nearest corner
     let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
 
+    // Shoulder span and superellipse exponent of the smoothed corner. The
+    // span is capped at half the shortest side, so saturated corners (pills,
+    // discs) relax to plain circles.
+    let corner_smoothing = corner_smoothing_params(corner_radius, size);
+    let corner_span = corner_smoothing.x;
+    let corner_exponent = corner_smoothing.y;
+
     // Width of the nearest borders
     let border = vec2<f32>(
         select(
@@ -624,10 +711,15 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // mirrored into bottom right quadrant.
     let corner_center_to_point = corner_to_point + corner_radius;
 
-    // Whether the nearest point on the border is rounded
+    // Vector from the point to the center of the corner's shoulder
+    // superellipse, also mirrored into bottom right quadrant.
+    let super_center_to_point = corner_to_point + corner_span;
+
+    // Whether the nearest point on the border is rounded. The smoothed corner
+    // reaches as far as corner_span along each edge.
     let is_near_rounded_corner =
-            corner_center_to_point.x >= 0 &&
-            corner_center_to_point.y >= 0;
+            super_center_to_point.x >= 0 &&
+            super_center_to_point.y >= 0;
 
     // Vector from straight border inner corner to point.
     let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
@@ -655,7 +747,8 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
+                                corner_span, corner_exponent);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -666,7 +759,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     //   nearest-point-on-ellipse.
     // * When it is quickly known to be outside the edge, -1.0 is used.
     var inner_sdf = 0.0;
-    if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
+    if (super_center_to_point.x <= 0 || super_center_to_point.y <= 0) {
         // Fast paths for straight borders.
         inner_sdf = -max(straight_border_inner_corner_to_point.x,
                          straight_border_inner_corner_to_point.y);
@@ -677,8 +770,16 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         // Fast path for circular inner edge.
         inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
-        let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
-        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        // The inner edge of a non-uniform border approximates the same
+        // smoothed corner inset by the border widths.
+        inner_sdf = min(
+            quarter_ellipse_sdf(
+                corner_center_to_point,
+                max(vec2<f32>(1e-4), vec2<f32>(corner_radius) - reduced_border)),
+            -superellipse_sdf(
+                max(super_center_to_point, vec2<f32>(0.0)),
+                max(vec2<f32>(1e-4), vec2<f32>(corner_span) - reduced_border),
+                corner_exponent));
     }
 
     // Negative when inside the border
@@ -753,6 +854,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let r_bl = quad.corner_radii.bottom_left;
                 let r_tl = quad.corner_radii.top_left;
 
+                // Smoothed corners end at the shoulder's tangency, so dash
+                // layout works in spans rather than radii.
+                let span_tr = corner_smoothing_params(r_tr, size).x;
+                let span_br = corner_smoothing_params(r_br, size).x;
+                let span_bl = corner_smoothing_params(r_bl, size).x;
+                let span_tl = corner_smoothing_params(r_tl, size).x;
+
                 let w_t = quad.border_widths.top;
                 let w_r = quad.border_widths.right;
                 let w_b = quad.border_widths.bottom;
@@ -765,10 +873,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let dv_l = select(dv_numerator / w_l, 0.0, w_l <= 0.0);
 
                 // Straight side lengths in dash space
-                let s_t = (size.x - r_tl - r_tr) * dv_t;
-                let s_r = (size.y - r_tr - r_br) * dv_r;
-                let s_b = (size.x - r_br - r_bl) * dv_b;
-                let s_l = (size.y - r_bl - r_tl) * dv_l;
+                let s_t = (size.x - span_tl - span_tr) * dv_t;
+                let s_r = (size.y - span_tr - span_br) * dv_r;
+                let s_b = (size.x - span_br - span_bl) * dv_b;
+                let s_l = (size.y - span_bl - span_tl) * dv_l;
 
                 let corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
                 let corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
@@ -776,10 +884,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
 
                 // Corner lengths in dash space
-                let c_tr = r_tr * (M_PI_F / 2.0) * corner_dash_velocity_tr;
-                let c_br = r_br * (M_PI_F / 2.0) * corner_dash_velocity_br;
-                let c_bl = r_bl * (M_PI_F / 2.0) * corner_dash_velocity_bl;
-                let c_tl = r_tl * (M_PI_F / 2.0) * corner_dash_velocity_tl;
+                let c_tr = corner_arc_length(r_tr, span_tr) * corner_dash_velocity_tr;
+                let c_br = corner_arc_length(r_br, span_br) * corner_dash_velocity_br;
+                let c_bl = corner_arc_length(r_bl, span_bl) * corner_dash_velocity_bl;
+                let c_tl = corner_arc_length(r_tl, span_tl) * corner_dash_velocity_tl;
 
                 // Cumulative dash space upto each segment
                 let upto_tr = s_t;
@@ -792,9 +900,15 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 max_t = upto_tl + c_tl;
 
                 if (is_near_rounded_corner) {
-                    let radians = atan2(corner_center_to_point.y,
-                                        corner_center_to_point.x);
-                    let corner_t = radians * corner_radius;
+                    // Angle in the shoulder frame: it stays within [0, pi/2]
+                    // across the whole corner region (the circle frame would
+                    // overshoot in the shoulder bands), so scale it to the
+                    // smoothed corner's arc length.
+                    let radians = atan2(super_center_to_point.y,
+                                        super_center_to_point.x);
+                    let corner_t = radians *
+                        corner_arc_length(corner_radius, corner_span) *
+                        (2.0 / M_PI_F);
 
                     if (center_to_point.x >= 0.0) {
                         if (center_to_point.y < 0.0) {
@@ -832,18 +946,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     if (is_horizontal) {
                         if (center_to_point.y < 0.0) {
                             dash_velocity = dv_t;
-                            t = (point.x - r_tl) * dash_velocity;
+                            t = (point.x - span_tl) * dash_velocity;
                         } else {
                             dash_velocity = dv_b;
-                            t = upto_bl - (point.x - r_bl) * dash_velocity;
+                            t = upto_bl - (point.x - span_bl) * dash_velocity;
                         }
                     } else {
                         if (center_to_point.x < 0.0) {
                             dash_velocity = dv_l;
-                            t = upto_tl - (point.y - r_tl) * dash_velocity;
+                            t = upto_tl - (point.y - span_tl) * dash_velocity;
                         } else {
                             dash_velocity = dv_r;
-                            t = upto_r + (point.y - r_tr) * dash_velocity;
+                            t = upto_r + (point.y - span_tr) * dash_velocity;
                         }
                     }
                 }
