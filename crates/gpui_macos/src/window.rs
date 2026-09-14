@@ -1,6 +1,7 @@
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
+    TISGetInputSourceProperty, WindowFrameSource,
+    events::{platform_input_from_native, read_modifiers},
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
@@ -26,11 +27,11 @@ use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -76,6 +77,21 @@ use std::{
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
+
+// NSTouchPhase: Began | Moved | Stationary are the phases in which a finger is
+// still on the pad.
+const TOUCH_PHASE_BEGAN: NSUInteger = 1 << 0;
+const TOUCH_PHASE_TOUCHING: NSUInteger = 0b0111;
+// NSTouchTypeMask::NSTouchTypeMaskIndirect — trackpad (and Magic Mouse)
+// touches, as opposed to direct touchscreen touches.
+const TOUCH_TYPE_MASK_INDIRECT: NSUInteger = 1;
+
+// Net horizontal travel of the three-touch centroid, in trackpad device units
+// (roughly millimeters), required before a swipe is reported.
+const TRACKPAD_SWIPE_THRESHOLD: f64 = 20.0;
+// Horizontal travel must dominate vertical by this factor for a swipe to
+// count, so a slightly angled swipe still qualifies.
+const TRACKPAD_SWIPE_DOMINANCE: f64 = 1.5;
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -236,6 +252,22 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
+                sel!(touchesBeganWithEvent:),
+                touches_began as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesMovedWithEvent:),
+                touches_moved as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesEndedWithEvent:),
+                touches_ended as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(touchesCancelledWithEvent:),
+                touches_cancelled as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
                 sel!(flagsChanged:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -356,6 +388,17 @@ unsafe fn build_classes() {
                     selector,
                     handle_overlay_event as extern "C" fn(&Object, Sel, id),
                 );
+            }
+            for (selector, method) in [
+                (
+                    sel!(touchesBeganWithEvent:),
+                    touches_began as extern "C" fn(&Object, Sel, id),
+                ),
+                (sel!(touchesMovedWithEvent:), touches_moved as _),
+                (sel!(touchesEndedWithEvent:), touches_ended as _),
+                (sel!(touchesCancelledWithEvent:), touches_cancelled as _),
+            ] {
+                decl.add_method(selector, method);
             }
             decl.register()
         };
@@ -609,6 +652,44 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    trackpad_swipe: TrackpadSwipeGesture,
+}
+
+/// Recognizes a three-finger horizontal swipe on a trackpad from the raw
+/// `NSTouch` stream, so it works regardless of the "Swipe between pages"
+/// system setting. macOS still owns the gesture when "Swipe between
+/// full-screen apps" uses three fingers: the touch stream then goes silent
+/// mid-sequence without Ended or Cancelled events, which is why every
+/// `touchesBeganWithEvent:` re-arms the state instead of relying on a clean
+/// all-fingers-up ending.
+struct TrackpadSwipeGesture {
+    enabled: bool,
+    /// Centroid of the touching fingers at the previous event, in device
+    /// units. `None` whenever the touching count is not three, so the delta
+    /// is re-anchored rather than jumping when a finger lifts or lands.
+    last_centroid: Option<NSPoint>,
+    /// Net centroid travel accumulated over this sequence.
+    translation: NSPoint,
+    fired: bool,
+}
+
+impl Default for TrackpadSwipeGesture {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            last_centroid: None,
+            translation: NSPoint::new(0.0, 0.0),
+            fired: false,
+        }
+    }
+}
+
+impl TrackpadSwipeGesture {
+    fn reset(&mut self) {
+        self.last_centroid = None;
+        self.translation = NSPoint::new(0.0, 0.0);
+        self.fired = false;
+    }
 }
 
 impl MacWindowState {
@@ -1020,6 +1101,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                trackpad_swipe: TrackpadSwipeGesture::default(),
             })));
 
             (*native_window).set_ivar(
@@ -1382,6 +1464,16 @@ impl PlatformWindow for MacWindow {
         let mut state = self.0.lock();
         state.traffic_light_position = Some(position);
         state.move_traffic_light();
+    }
+
+    fn set_trackpad_navigation_swipe_enabled(&self, enabled: bool) {
+        let mut state = self.0.lock();
+        state.trackpad_swipe.enabled = enabled;
+        state.trackpad_swipe.reset();
+        unsafe {
+            let mask = if enabled { TOUCH_TYPE_MASK_INDIRECT } else { 0 };
+            let () = msg_send![state.native_view.as_ref(), setAllowedTouchTypes: mask];
+        }
     }
 
     fn scale_factor(&self) -> f32 {
@@ -2707,6 +2799,112 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             callback(event);
             window_state.lock().event_callback = Some(callback);
         }
+    }
+}
+
+extern "C" fn touches_began(this: &Object, _: Sel, native_event: id) {
+    if !handle_touch_event(this, native_event) {
+        unsafe { msg_send![super(this, class!(NSView)), touchesBeganWithEvent: native_event] }
+    }
+}
+
+extern "C" fn touches_moved(this: &Object, _: Sel, native_event: id) {
+    if !handle_touch_event(this, native_event) {
+        unsafe { msg_send![super(this, class!(NSView)), touchesMovedWithEvent: native_event] }
+    }
+}
+
+extern "C" fn touches_ended(this: &Object, _: Sel, native_event: id) {
+    if !handle_touch_event(this, native_event) {
+        unsafe { msg_send![super(this, class!(NSView)), touchesEndedWithEvent: native_event] }
+    }
+}
+
+extern "C" fn touches_cancelled(this: &Object, _: Sel, native_event: id) {
+    if !handle_touch_event(this, native_event) {
+        unsafe { msg_send![super(this, class!(NSView)), touchesCancelledWithEvent: native_event] }
+    }
+}
+
+/// Tracks the touch stream for the three-finger navigation swipe. Returns
+/// whether the event was consumed: touches are claimed whenever recognition
+/// is enabled so a sequence in flight keeps arriving here instead of bubbling
+/// up the responder chain.
+fn handle_touch_event(this: &Object, native_event: id) -> bool {
+    unsafe {
+        let window_state = get_window_state(this);
+        let mut lock = window_state.lock();
+        if !lock.trackpad_swipe.enabled {
+            return false;
+        }
+
+        let this = this as *const Object as id;
+        let began: id =
+            msg_send![native_event, touchesMatchingPhase: TOUCH_PHASE_BEGAN inView: this];
+        let began_count: NSUInteger = msg_send![began, count];
+        let touching: id =
+            msg_send![native_event, touchesMatchingPhase: TOUCH_PHASE_TOUCHING inView: this];
+        let touching_count: NSUInteger = msg_send![touching, count];
+
+        if began_count > 0 || touching_count == 0 {
+            lock.trackpad_swipe.reset();
+        }
+        if touching_count != 3 || lock.trackpad_swipe.fired {
+            lock.trackpad_swipe.last_centroid = None;
+            return true;
+        }
+
+        let touches: id = msg_send![touching, allObjects];
+        let mut centroid = NSPoint::new(0.0, 0.0);
+        for index in 0..touching_count {
+            let touch: id = msg_send![touches, objectAtIndex: index];
+            let position: NSPoint = msg_send![touch, normalizedPosition];
+            let device_size: NSSize = msg_send![touch, deviceSize];
+            centroid.x += position.x * device_size.width;
+            centroid.y += position.y * device_size.height;
+        }
+        centroid.x /= touching_count as f64;
+        centroid.y /= touching_count as f64;
+
+        let Some(last_centroid) = lock.trackpad_swipe.last_centroid else {
+            lock.trackpad_swipe.last_centroid = Some(centroid);
+            return true;
+        };
+        lock.trackpad_swipe.translation.x += centroid.x - last_centroid.x;
+        lock.trackpad_swipe.translation.y += centroid.y - last_centroid.y;
+        lock.trackpad_swipe.last_centroid = Some(centroid);
+
+        let translation = lock.trackpad_swipe.translation;
+        if translation.x.abs() < TRACKPAD_SWIPE_THRESHOLD
+            || translation.x.abs() < TRACKPAD_SWIPE_DOMINANCE * translation.y.abs()
+        {
+            return true;
+        }
+        lock.trackpad_swipe.fired = true;
+
+        // Same direction convention as the NSEventTypeSwipe path in
+        // platform_input_from_native: physical rightward travel is Back.
+        let direction = if translation.x > 0.0 {
+            NavigationDirection::Back
+        } else {
+            NavigationDirection::Forward
+        };
+        let window_height = lock.content_size().height;
+        let position = native_event.locationInWindow();
+        let event = PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Navigate(direction),
+            position: point(px(position.x as f32), window_height - px(position.y as f32)),
+            modifiers: read_modifiers(native_event),
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        if let Some(mut callback) = lock.event_callback.take() {
+            drop(lock);
+            callback(event);
+            window_state.lock().event_callback = Some(callback);
+        }
+        true
     }
 }
 

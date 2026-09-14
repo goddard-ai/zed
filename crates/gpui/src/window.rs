@@ -2181,6 +2181,15 @@ impl Window {
         self.platform_window.create_native_surface()
     }
 
+    /// Enables recognition of three-finger horizontal trackpad swipes, which
+    /// are delivered as `MouseButton::Navigate` mouse-down events.
+    ///
+    /// macOS only; a no-op elsewhere.
+    pub fn set_trackpad_navigation_swipe_enabled(&self, enabled: bool) {
+        self.platform_window
+            .set_trackpad_navigation_swipe_enabled(enabled)
+    }
+
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {

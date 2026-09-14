@@ -911,6 +911,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
 
+    /// macOS only: when enabled, three-finger horizontal trackpad swipes are
+    /// recognized from the window's `NSTouch` stream and delivered as
+    /// `MouseButton::Navigate` mouse-down events.
+    fn set_trackpad_navigation_swipe_enabled(&self, _enabled: bool) {}
+
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
 
