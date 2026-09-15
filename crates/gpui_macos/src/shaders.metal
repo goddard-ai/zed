@@ -230,10 +230,13 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     inner_sdf = -(outer_sdf + reduced_border.x);
   } else {
     // The inner edge of a non-uniform border approximates the same smoothed
-    // corner inset by the border widths.
+    // corner inset by the border widths. Each curve term is clamped to its
+    // own quadrant so that, in the shoulder band where its frame goes
+    // negative, it relaxes to the straight inner edge instead of measuring
+    // the far side of the curve.
     inner_sdf = min(
         quarter_ellipse_sdf(
-            corner_center_to_point,
+            max(corner_center_to_point, float2(0.0)),
             max(float2(1e-4), float2(corner_radius) - reduced_border)),
         -superellipse_sdf(
             max(super_center_to_point, float2(0.0)),
