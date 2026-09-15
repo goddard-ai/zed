@@ -83,8 +83,9 @@ const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
 const TOUCH_PHASE_BEGAN: NSUInteger = 1 << 0;
 const TOUCH_PHASE_TOUCHING: NSUInteger = 0b0111;
 // NSTouchTypeMask::NSTouchTypeMaskIndirect — trackpad (and Magic Mouse)
-// touches, as opposed to direct touchscreen touches.
-const TOUCH_TYPE_MASK_INDIRECT: NSUInteger = 1;
+// touches, as opposed to direct touchscreen touches. The mask bits are
+// 1 << NSTouchType, and NSTouchTypeIndirect is 1.
+const TOUCH_TYPE_MASK_INDIRECT: NSUInteger = 1 << 1;
 
 // Net horizontal travel of the three-touch centroid, in trackpad device units
 // (roughly millimeters), required before a swipe is reported.
@@ -2882,9 +2883,10 @@ fn handle_touch_event(this: &Object, native_event: id) -> bool {
         }
         lock.trackpad_swipe.fired = true;
 
-        // Same direction convention as the NSEventTypeSwipe path in
-        // platform_input_from_native: physical rightward travel is Back.
-        let direction = if translation.x > 0.0 {
+        // Discrete three-finger swipes follow the system's "Swipe between
+        // pages" convention — leftward travel is Back — not the two-finger
+        // scroll mode where the content follows the fingers.
+        let direction = if translation.x < 0.0 {
             NavigationDirection::Back
         } else {
             NavigationDirection::Forward
