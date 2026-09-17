@@ -1061,13 +1061,18 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         }
     }
 
+    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                      shadow.element_corner_radii);
     if (shadow.inset != 0u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                          shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow only exists outside its element: without the cutout the
+        // blurred silhouette fills the interior beneath the fill and shows
+        // through a translucent element, e.g. one fading in under `opacity`.
+        alpha *= saturate(element_distance + 0.5);
     }
 
     return input.color * float4(1., 1., 1., alpha);
