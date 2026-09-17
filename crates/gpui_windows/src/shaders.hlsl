@@ -334,11 +334,11 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
 // first-order normalization of its implicit function. Accurate near the
 // curve, which is all the antialiasing and border logic needs. Expects point
 // components >= 0. Negative inside, positive outside.
-float superellipse_sdf(float2 point, float2 radii, float exponent) {
-    float2 e = pow(point / radii, float2(exponent, exponent));
+float superellipse_sdf(float2 pt, float2 radii, float exponent) {
+    float2 e = pow(pt / radii, float2(exponent, exponent));
     float s = max(e.x + e.y, 1e-12);
     float f = pow(s, 1.0 / exponent) - 1.0;
-    float2 grad_xy = pow(point, float2(exponent - 1.0, exponent - 1.0)) / pow(radii, float2(exponent, exponent));
+    float2 grad_xy = pow(pt, float2(exponent - 1.0, exponent - 1.0)) / pow(radii, float2(exponent, exponent));
     float grad = pow(s, (1.0 - exponent) / exponent) * length(grad_xy);
     return f / max(grad, 1e-5);
 }
