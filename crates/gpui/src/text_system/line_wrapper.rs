@@ -66,13 +66,19 @@ impl LineWrapper {
                         }
 
                         if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
+                            if (prev_c == ' ' || Self::is_trailing_punctuation(prev_c))
+                                && c != ' '
+                                && first_non_whitespace_ix.is_some()
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
                         } else {
                             // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
+                            if c != ' '
+                                && !Self::is_trailing_punctuation(c)
+                                && first_non_whitespace_ix.is_some()
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
@@ -90,7 +96,9 @@ impl LineWrapper {
                         width: element_width,
                         ..
                     } => {
-                        if prev_c == ' ' && first_non_whitespace_ix.is_some() {
+                        if (prev_c == ' ' || Self::is_trailing_punctuation(prev_c))
+                            && first_non_whitespace_ix.is_some()
+                        {
                             last_candidate_ix = ix;
                             last_candidate_width = width;
                         }
@@ -378,11 +386,16 @@ impl LineWrapper {
             let char_width = self.width_for_char(c);
 
             if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
+                if (prev_c == ' ' || Self::is_trailing_punctuation(prev_c))
+                    && first_non_whitespace_ix.is_some()
+                {
                     last_candidate_ix = ix;
                     last_candidate_width = width;
                 }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            } else if c != ' '
+                && !Self::is_trailing_punctuation(c)
+                && first_non_whitespace_ix.is_some()
+            {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -476,11 +489,32 @@ impl LineWrapper {
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
         // is included so it stays attached to the preceding word when wrapping.
         matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // Quotation marks glue to the text they quote on both sides (UAX #14
+        // class QU): `"quoted"` wraps as a unit and a quote never starts a line.
+        matches!(c, '"' | '“' | '”' | '«' | '»' | '‹' | '›') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯') ||
 
         // Non-breaking glue characters
         matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
+    }
+
+    /// Terminal and closing punctuation that must not start a wrapped line —
+    /// it glues to the preceding word (UAX #14 classes CL, CP, EX, IS, SY, and
+    /// BA for dashes). These characters are never break candidates themselves;
+    /// instead they pass the break opportunity to the character after them.
+    pub(crate) fn is_trailing_punctuation(c: char) -> bool {
+        matches!(c,
+            '!' | '?' | ')' | ']' | '}' | '/' | '…' |
+            // Break after a dash, never before one.
+            '—' | '–' |
+            '‽' | '‼' | '⁇' | '⁈' | '⁉' |
+            '\u{3001}' | '\u{3002}' |                          // 、。
+            '\u{3009}' | '\u{300B}' | '\u{300D}' | '\u{300F}' | '\u{3011}' |  // 〉》」』】
+            '\u{3015}' | '\u{3017}' | '\u{3019}' | '\u{301B}' |  // 〕〗〙〛
+            '\u{FF01}' | '\u{FF0C}' | '\u{FF0E}' |             // ！，．
+            '\u{FF09}' | '\u{FF1A}' | '\u{FF1B}' | '\u{FF1F}' | '\u{FF3D}' | '\u{FF5D}'
+        )
     }
 
     #[inline(always)]
@@ -859,6 +893,67 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_line_trailing_punctuation() {
+        let mut wrapper = build_wrapper();
+
+        // At 72px (~7.5 chars), `aa ` fits and the 8th column overflows. Trailing
+        // punctuation must glue to its word, so the line wraps before `bbbb`
+        // instead of leaving the punctuation alone on the next line.
+        for c in [
+            '!', '?', ')', ']', '}', '/', '…', '—', '–', '"', '”', '»', '’', '\'',
+        ] {
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text(&format!("aa bbbb{c}"))], px(72.))
+                    .collect::<Vec<_>>(),
+                &[Boundary::new(3, 0)],
+                "line should not break before '{c}' (unicode 0x{:x})",
+                c as u32
+            );
+        }
+
+        // The break opportunity moves to after the trailing punctuation:
+        // `a foo/bar b` wraps after the `/` instead of before it.
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("a foo/bar b")], px(72.))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(6, 0)],
+        );
+
+        // Opening punctuation stays a break-before candidate: the line can still
+        // wrap before `(` so `(bbbb` moves down as a unit.
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aa (bbbb c")], px(72.))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(3, 0)],
+        );
+    }
+
+    #[test]
+    fn test_multiline_truncation_trailing_punctuation() {
+        let mut wrapper = build_wrapper();
+
+        // Line 1 fits `aa `, so `bbbb!` carries down whole; line 2 then
+        // truncates right after it (the `!` is eaten by the ellipsis trim).
+        // Before the fix `!` was a wrap candidate, so line 2 started at the
+        // `!` and the truncation point reached further into `ccc ddd`.
+        let text: &str = "aa bbbb! ccc ddd";
+        let runs = generate_test_runs(&[text.len()]);
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            px(72.),
+            2,
+            "\u{2026}",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        assert_eq!(truncated.as_ref(), "aa bbbb\u{2026}");
+    }
+
+    #[test]
     fn test_truncate_line_end() {
         let mut wrapper = build_wrapper();
 
@@ -1153,6 +1248,12 @@ mod tests {
         assert_word("won’t");
         assert_word("‘twas");
 
+        // Quotation marks glue to the quoted text on both sides (UAX #14 QU).
+        assert_word("\"quoted\"");
+        assert_word("“quoted”");
+        assert_word("«quoted»");
+        assert_word("‹quoted›");
+
         // Space
         assert_not_word("foo bar");
 
@@ -1249,6 +1350,39 @@ mod tests {
                         glyph_ix: 18
                     }
                 ],
+            );
+        });
+    }
+
+    // These seem to vary wildly based on the text system.
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn test_wrap_shaped_line_trailing_punctuation(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+
+            let normal = TextRun {
+                len: 0,
+                font: font(".ZedMono"),
+                color: Default::default(),
+                underline: Default::default(),
+                ..Default::default()
+            };
+
+            // With .ZedMono at 16px, each char is 9.6px wide, so `aa ` fits
+            // and the `!` overflows. The `!` must not be a wrap boundary —
+            // the line wraps before `bbbb` and carries `bbbb!` down whole.
+            let text = "aa bbbb!".into();
+            let lines = text_system
+                .shape_text(text, px(16.), &[normal.with_len(8)], Some(px(72.)), None)
+                .unwrap();
+
+            assert_eq!(
+                lines[0].layout.wrap_boundaries(),
+                &[WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix: 3
+                }],
             );
         });
     }
